@@ -38,7 +38,9 @@ data class VFDetectionResult(
     val count: Int,
     val inferMs: Float,
     val detections: List<ShortlinkDetection>,
-    val metadataJson: String
+    val metadataJson: String,
+    val frameWidth: Int = 0,
+    val frameHeight: Int = 0
 )
 
 class VFModelLoader {
@@ -166,7 +168,11 @@ class VFModelLoader {
                         val y1 = (row[1] * scaleY).coerceIn(0f, origHeight.toFloat())
                         val x2 = (row[2] * scaleX).coerceIn(0f, origWidth.toFloat())
                         val y2 = (row[3] * scaleY).coerceIn(0f, origHeight.toFloat())
-                        if ((x2 - x1) > 2f && (y2 - y1) > 2f) {
+                        val bw = x2 - x1
+                        val bh = y2 - y1
+                        val maxAllowedW = origWidth * 0.35f
+                        val maxAllowedH = origHeight * 0.35f
+                        if (bw > 8f && bh > 8f && bw < maxAllowedW && bh < maxAllowedH) {
                             rawCandidates.add(
                                 ShortlinkDetection(
                                     id = 0,
@@ -196,7 +202,9 @@ class VFModelLoader {
             count = kept.size,
             inferMs = inferMs,
             detections = kept,
-            metadataJson = metadataJson
+            metadataJson = metadataJson,
+            frameWidth = origWidth,
+            frameHeight = origHeight
         )
     }
 

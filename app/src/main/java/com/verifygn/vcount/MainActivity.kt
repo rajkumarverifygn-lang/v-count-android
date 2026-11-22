@@ -6,9 +6,11 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ImageDecoder
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -44,11 +46,16 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.util.concurrent.Executors
 import kotlin.math.min
+
+private const val DEFAULT_MODEL_URL =
+    "https://raw.githubusercontent.com/rajkumarverifygn-lang/shortlink_model/main/best_fast.vf"
 
 class MainActivity : ComponentActivity() {
     private val vfLoader = VFModelLoader()
@@ -68,53 +75,106 @@ fun VCountAppScreen(vfLoader: VFModelLoader) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    var activeTab by remember { mutableIntStateOf(0) } // 0=Image Detect, 1=Live Camera, 2=GitHub Model
-    var githubUrl by remember {
-        mutableStateOf("https://raw.githubusercontent.com/rajkumarverifygn-lang/shortlink_model/main/best_fast.vf")
-    }
-    var modelStatus by remember { mutableStateOf("Loading model from GitHub...") }
+    var activeTab by remember { mutableIntStateOf(0) } // 0=Image Detect, 1=Live Camera
+    var modelStatus by remember { mutableStateOf("Initializing AI model...") }
     var isModelLoaded by remember { mutableStateOf(false) }
 
     var selectedBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var annotatedBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var shortlinkCount by remember { mutableIntStateOf(0) }
     var inferMs by remember { mutableFloatStateOf(0f) }
-    var confThreshold by remember { mutableFloatStateOf(0.25f) }
-    var iouThreshold by remember { mutableFloatStateOf(0.45f) }
+    var confThreshold by remember { mutableFloatStateOf(0.42f) }
+    val iouThreshold = 0.45f
     var isDetecting by remember { mutableStateOf(false) }
 
     var liveDetections by remember { mutableStateOf<List<ShortlinkDetection>>(emptyList()) }
+    var liveFrameW by remember { mutableIntStateOf(0) }
+    var liveFrameH by remember { mutableIntStateOf(0) }
+    var hasCameraPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
+                PackageManager.PERMISSION_GRANTED
+        )
+    }
+
+    // URI for full-resolution still camera capture
+    var capturedPhotoUri by remember { mutableStateOf<Uri?>(null) }
+
+    fun decodeUriToBitmap(uri: Uri): Bitmap? {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val src = ImageDecoder.createSource(context.contentResolver, uri)
+                ImageDecoder.decodeBitmap(src) { decoder, _, _ ->
+                    decoder.isMutableRequired = true
+                }
+            } else {
+                context.contentResolver.openInputStream(uri)?.use { stream ->
+                    BitmapFactory.decodeStream(stream)
+                }
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
 
     val imagePicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         uri?.let {
-            context.contentResolver.openInputStream(it)?.use { stream ->
-                selectedBitmap = BitmapFactory.decodeStream(stream)
+            decodeUriToBitmap(it)?.let { bmp ->
+                selectedBitmap = bmp
                 annotatedBitmap = null
+            }
+        }
+    }
+
+    val takePictureLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.TakePicture()
+    ) { success: Boolean ->
+        if (success) {
+            capturedPhotoUri?.let { uri ->
+                decodeUriToBitmap(uri)?.let { bmp ->
+                    selectedBitmap = bmp
+                    annotatedBitmap = null
+                }
             }
         }
     }
 
     val cameraPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
-    ) { _ -> }
+    ) { granted ->
+        hasCameraPermission = granted
+    }
 
-    // Auto-request camera permission and auto-load best_fast.vf from GitHub on startup
+    fun launchCameraCapture() {
+        if (!hasCameraPermission) {
+            cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+            return
+        }
+        val photoFile = File(context.cacheDir, "vcount_capture_${System.currentTimeMillis()}.jpg")
+        val uri = FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            photoFile
+        )
+        capturedPhotoUri = uri
+        takePictureLauncher.launch(uri)
+    }
+
+    // Auto-request camera permission and silently load the AI model on startup
     LaunchedEffect(Unit) {
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
+        if (!hasCameraPermission) {
             cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
         }
         try {
             withContext(Dispatchers.IO) {
-                vfLoader.loadFromGithubUrl(githubUrl)
+                vfLoader.loadFromGithubUrl(DEFAULT_MODEL_URL)
             }
             isModelLoaded = true
-            modelStatus = "Model Ready (GitHub)"
+            modelStatus = "Model Ready"
         } catch (e: Exception) {
-            modelStatus = "Load Error: ${e.message}"
+            modelStatus = "Load Failed: ${e.message}"
         }
     }
 
@@ -135,12 +195,6 @@ fun VCountAppScreen(vfLoader: VFModelLoader) {
                     onClick = { activeTab = 1 },
                     label = { Text("Live Camera") },
                     icon = { Text("🎥", fontSize = 18.sp) }
-                )
-                NavigationBarItem(
-                    selected = activeTab == 2,
-                    onClick = { activeTab = 2 },
-                    label = { Text("GitHub Model") },
-                    icon = { Text("☁️", fontSize = 18.sp) }
                 )
             }
         }
@@ -254,7 +308,7 @@ fun VCountAppScreen(vfLoader: VFModelLoader) {
 
             when (activeTab) {
                 0 -> {
-                    // TAB 1: UPLOAD IMAGE -> PRESS DETECT & COUNT
+                    // TAB 1: UPLOAD OR CAPTURE IMAGE -> PRESS DETECT & COUNT
                     Card(
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(16.dp),
@@ -262,10 +316,10 @@ fun VCountAppScreen(vfLoader: VFModelLoader) {
                     ) {
                         Column(modifier = Modifier.padding(14.dp)) {
                             Text(
-                                text = "1. Upload Image → 2. Press Detect & Count",
+                                text = "1. Upload or Capture Photo → 2. Detect & Count",
                                 color = androidx.compose.ui.graphics.Color.White,
                                 fontWeight = FontWeight.Bold,
-                                fontSize = 14.sp
+                                fontSize = 13.sp
                             )
                             Spacer(modifier = Modifier.height(10.dp))
 
@@ -273,7 +327,7 @@ fun VCountAppScreen(vfLoader: VFModelLoader) {
                             Box(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .height(330.dp)
+                                    .height(320.dp)
                                     .background(androidx.compose.ui.graphics.Color(0xFF030712), RoundedCornerShape(12.dp))
                                     .border(1.dp, androidx.compose.ui.graphics.Color(0xFF1E293B), RoundedCornerShape(12.dp)),
                                 contentAlignment = Alignment.Center
@@ -287,8 +341,9 @@ fun VCountAppScreen(vfLoader: VFModelLoader) {
                                     )
                                 } else {
                                     Text(
-                                        text = "Tap 'Upload Image' to select a photo",
-                                        color = androidx.compose.ui.graphics.Color(0xFF64748B)
+                                        text = "Upload an image or capture from camera",
+                                        color = androidx.compose.ui.graphics.Color(0xFF64748B),
+                                        fontSize = 13.sp
                                     )
                                 }
                             }
@@ -297,45 +352,57 @@ fun VCountAppScreen(vfLoader: VFModelLoader) {
 
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
                                 OutlinedButton(
                                     onClick = { imagePicker.launch("image/*") },
                                     modifier = Modifier.weight(1f)
                                 ) {
-                                    Text("Upload Image", fontWeight = FontWeight.Bold)
+                                    Text("Upload", fontWeight = FontWeight.Bold)
                                 }
 
-                                Button(
-                                    onClick = {
-                                        val bmp = selectedBitmap ?: return@Button
-                                        scope.launch {
-                                            isDetecting = true
-                                            try {
-                                                val (res, drawn) = withContext(Dispatchers.Default) {
-                                                    runBitmapDetection(vfLoader, bmp, confThreshold, iouThreshold)
-                                                }
-                                                shortlinkCount = res.count
-                                                inferMs = res.inferMs
-                                                annotatedBitmap = drawn
-                                            } catch (e: Exception) {
-                                                modelStatus = "Detect Error: ${e.message}"
-                                            } finally {
-                                                isDetecting = false
-                                            }
-                                        }
-                                    },
-                                    enabled = (selectedBitmap != null && isModelLoaded && !isDetecting),
-                                    modifier = Modifier.weight(1f),
-                                    colors = ButtonDefaults.buttonColors(
-                                        containerColor = androidx.compose.ui.graphics.Color(0xFF22C55E)
-                                    )
+                                OutlinedButton(
+                                    onClick = { launchCameraCapture() },
+                                    modifier = Modifier.weight(1f)
                                 ) {
-                                    Text(
-                                        if (isDetecting) "Detecting..." else "Detect & Count",
-                                        fontWeight = FontWeight.Bold
-                                    )
+                                    Text("Camera", fontWeight = FontWeight.Bold)
                                 }
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            Button(
+                                onClick = {
+                                    val bmp = selectedBitmap ?: return@Button
+                                    scope.launch {
+                                        isDetecting = true
+                                        try {
+                                            val (res, drawn) = withContext(Dispatchers.Default) {
+                                                runBitmapDetection(vfLoader, bmp, confThreshold, iouThreshold)
+                                            }
+                                            shortlinkCount = res.count
+                                            inferMs = res.inferMs
+                                            annotatedBitmap = drawn
+                                        } catch (e: Exception) {
+                                            modelStatus = "Detect Error: ${e.message}"
+                                        } finally {
+                                            isDetecting = false
+                                        }
+                                    }
+                                },
+                                enabled = (selectedBitmap != null && isModelLoaded && !isDetecting),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(48.dp),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = androidx.compose.ui.graphics.Color(0xFF22C55E)
+                                )
+                            ) {
+                                Text(
+                                    if (isDetecting) "Detecting & Counting..." else "Detect & Count",
+                                    fontWeight = FontWeight.ExtraBold,
+                                    fontSize = 15.sp
+                                )
                             }
                         }
                     }
@@ -357,9 +424,16 @@ fun VCountAppScreen(vfLoader: VFModelLoader) {
                             )
                             Spacer(modifier = Modifier.height(10.dp))
 
-                            if (!isModelLoaded) {
+                            if (!hasCameraPermission) {
+                                Button(
+                                    onClick = { cameraPermissionLauncher.launch(Manifest.permission.CAMERA) },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text("Allow Camera Permission")
+                                }
+                            } else if (!isModelLoaded) {
                                 Text(
-                                    text = "Waiting for model to finish loading from GitHub...",
+                                    text = "Initializing AI model...",
                                     color = androidx.compose.ui.graphics.Color(0xFFFBBF24),
                                     fontSize = 13.sp
                                 )
@@ -378,14 +452,25 @@ fun VCountAppScreen(vfLoader: VFModelLoader) {
                                             shortlinkCount = res.count
                                             inferMs = res.inferMs
                                             liveDetections = res.detections
+                                            liveFrameW = res.frameWidth
+                                            liveFrameH = res.frameHeight
                                         }
                                     )
                                     ComposeCanvas(modifier = Modifier.fillMaxSize()) {
+                                        // Map normalized boxes to the exact FIT_CENTER video rectangle
+                                        val fw = if (liveFrameW > 0) liveFrameW.toFloat() else size.width
+                                        val fh = if (liveFrameH > 0) liveFrameH.toFloat() else size.height
+                                        val fitScale = min(size.width / fw, size.height / fh)
+                                        val drawW = fw * fitScale
+                                        val drawH = fh * fitScale
+                                        val offX = (size.width - drawW) * 0.5f
+                                        val offY = (size.height - drawH) * 0.5f
+
                                         for (det in liveDetections) {
-                                            val x1 = det.boxNorm.left * size.width
-                                            val y1 = det.boxNorm.top * size.height
-                                            val x2 = det.boxNorm.right * size.width
-                                            val y2 = det.boxNorm.bottom * size.height
+                                            val x1 = offX + det.boxNorm.left * drawW
+                                            val y1 = offY + det.boxNorm.top * drawH
+                                            val x2 = offX + det.boxNorm.right * drawW
+                                            val y2 = offY + det.boxNorm.bottom * drawH
                                             drawRect(
                                                 color = androidx.compose.ui.graphics.Color(0xFF22C55E),
                                                 topLeft = Offset(x1, y1),
@@ -408,55 +493,29 @@ fun VCountAppScreen(vfLoader: VFModelLoader) {
                                     }
                                 }
                             }
-                        }
-                    }
-                }
 
-                2 -> {
-                    // TAB 3: GITHUB MODEL LOADER
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(16.dp),
-                        colors = CardDefaults.cardColors(containerColor = androidx.compose.ui.graphics.Color(0xFF111928))
-                    ) {
-                        Column(modifier = Modifier.padding(14.dp)) {
-                            Text(
-                                text = "GitHub .vf Model Source",
-                                color = androidx.compose.ui.graphics.Color.White,
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 15.sp
-                            )
-                            Spacer(modifier = Modifier.height(8.dp))
-                            OutlinedTextField(
-                                value = githubUrl,
-                                onValueChange = { githubUrl = it },
-                                label = { Text("GitHub Raw .vf URL") },
-                                modifier = Modifier.fillMaxWidth(),
-                                singleLine = true
-                            )
                             Spacer(modifier = Modifier.height(10.dp))
-                            Button(
-                                onClick = {
-                                    scope.launch {
-                                        modelStatus = "Downloading .vf from GitHub..."
-                                        try {
-                                            withContext(Dispatchers.IO) {
-                                                vfLoader.loadFromGithubUrl(githubUrl)
-                                            }
-                                            isModelLoaded = true
-                                            modelStatus = "Model Ready (GitHub)"
-                                        } catch (e: Exception) {
-                                            modelStatus = "Error: ${e.message}"
-                                        }
-                                    }
-                                },
+                            Row(
                                 modifier = Modifier.fillMaxWidth(),
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = androidx.compose.ui.graphics.Color(0xFF16A34A)
-                                )
+                                horizontalArrangement = Arrangement.SpaceBetween
                             ) {
-                                Text("Reload Model from GitHub", fontWeight = FontWeight.Bold)
+                                Text(
+                                    text = "Detection Filter (Threshold)",
+                                    color = androidx.compose.ui.graphics.Color(0xFF94A3B8),
+                                    fontSize = 12.sp
+                                )
+                                Text(
+                                    text = "${"%.2f".format(confThreshold)}",
+                                    color = androidx.compose.ui.graphics.Color(0xFF4ADE80),
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
                             }
+                            Slider(
+                                value = confThreshold,
+                                onValueChange = { confThreshold = it },
+                                valueRange = 0.20f..0.75f
+                            )
                         }
                     }
                 }
@@ -472,14 +531,18 @@ fun LiveCameraAnalyzerView(
     iouThreshold: Float,
     onResult: (VFDetectionResult) -> Unit
 ) {
-    val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val executor = remember { Executors.newSingleThreadExecutor() }
+    val latestConf by rememberUpdatedState(confThreshold)
+    val latestIou by rememberUpdatedState(iouThreshold)
 
     AndroidView(
         modifier = Modifier.fillMaxSize(),
         factory = { ctx ->
-            val previewView = PreviewView(ctx)
+            val previewView = PreviewView(ctx).apply {
+                implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+                scaleType = PreviewView.ScaleType.FIT_CENTER
+            }
             val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
             cameraProviderFuture.addListener({
                 val cameraProvider = cameraProviderFuture.get()
@@ -500,7 +563,7 @@ fun LiveCameraAnalyzerView(
                         } else {
                             rawBmp
                         }
-                        val (res, _) = runBitmapDetection(vfLoader, bmp, confThreshold, iouThreshold, drawOutput = false)
+                        val (res, _) = runBitmapDetection(vfLoader, bmp, latestConf, latestIou, drawOutput = false)
                         ContextCompat.getMainExecutor(ctx).execute {
                             onResult(res)
                         }
@@ -510,13 +573,16 @@ fun LiveCameraAnalyzerView(
                     }
                 }
 
-                cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(
-                    lifecycleOwner,
-                    CameraSelector.DEFAULT_BACK_CAMERA,
-                    preview,
-                    analyzer
-                )
+                try {
+                    cameraProvider.unbindAll()
+                    cameraProvider.bindToLifecycle(
+                        lifecycleOwner,
+                        CameraSelector.DEFAULT_BACK_CAMERA,
+                        preview,
+                        analyzer
+                    )
+                } catch (_: Exception) {
+                }
             }, ContextCompat.getMainExecutor(ctx))
             previewView
         }
